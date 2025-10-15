@@ -72,8 +72,7 @@ function onOpen() {
     .addItem('3. Generate Next Cover Letter', 'generateSingleCoverLetter')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('Debug')
-        .addItem('Reset Setup Lock', 'resetSetupLock')
-        .addItem('Force Sort Sheet', 'sortJobsSheet'))
+        .addItem('Reset Setup Lock', 'resetSetupLock'))
     .addToUi();
 }
 
@@ -378,108 +377,88 @@ function findAndProcessNewJobs() {
       processJobs(newJobs);
       sortJobsSheet();
       sendNotificationEmail(newJobs.length, settings.notificationEmail);
-      SpreadsheetApp.getUi().alert('Success!', `${newJobs.length} new jobs added. Cover letters will now be generated in the background.`, SpreadsheetApp.getUi().ButtonSet.OK);
+      SPREADSHEET.toast(`Success! ${newJobs.length} new jobs were added.`);
     } else {
-       SpreadsheetApp.getUi().alert('No new jobs found.', 'No new jobs matching your criteria were found from TheirStack.', SpreadsheetApp.getUi().ButtonSet.OK);
+       Logger.log('No new jobs found during this run.');
+       SPREADSHEET.toast('No new jobs were found that match your criteria.');
     }
   } catch (e) {
-    Logger.log(e);
-    SpreadsheetApp.getUi().alert('Error', e.message, SpreadsheetApp.getUi().ButtonSet.OK);
+    Logger.log(`Error in findAndProcessNewJobs: ${e.message}`);
+    SPREADSHEET.toast(`An error occurred: ${e.message}`);
   }
 }
 
 /**
- * Finds jobs using the TheirStack service, paginating to get all results.
+ * Finds jobs using the TheirStack service.
  * @param {object} settings The script settings.
  * @returns {Array<object>} An array of job objects.
  */
 function findJobsWithTheirStack(settings) {
     const url = `https://api.theirstack.com/v1/jobs/search`;
     const existingJobIds = getExistingJobIds();
-    let allJobs = [];
-    let page = 0;
-    const limit = 100; // TheirStack's max limit per page
 
-    while (true) {
-        const payload = {
-            limit: limit,
-            order_by: [{
-                desc: true,
-                field: "date_posted"
-            }],
-            blur_company_data: false,
-            job_title_or: [settings.keywords],
-            job_country_code_or: ["US"],
-            posted_at_max_age_days: 30,
-            company_country_code_or: ["US"],
-            remote: true,
-            page: page,
-            include_total_results: false,
-            job_id_not: existingJobIds
-        };
+    const payload = {
+        include_total_results: false,
+        posted_at_max_age_days: 30,
+        job_country_code_or: ["US"],
+        job_title_or: [settings.keywords],
+        company_country_code_or: ["US"],
+        min_salary_usd: 1,
+        remote: true,
+        page: 0,
+        limit: 50,
+        blur_company_data: false,
+        job_id_not: existingJobIds
+    };
 
-        const options = {
-            method: 'post',
-            contentType: 'application/json',
-            headers: {
-                'Authorization': 'Bearer ' + settings.theirStackApiKey
-            },
-            payload: JSON.stringify(payload),
-            muteHttpExceptions: true
-        };
+    const options = {
+        method: 'post',
+        contentType: 'application/json',
+        headers: {
+            'Authorization': 'Bearer ' + settings.theirStackApiKey
+        },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+    };
 
-        try {
-            const response = UrlFetchApp.fetch(url, options);
-            const responseText = response.getContentText();
-            const result = JSON.parse(responseText);
+    try {
+        const response = UrlFetchApp.fetch(url, options);
+        const responseText = response.getContentText();
+        const result = JSON.parse(responseText);
 
-            if (result.error) {
-                const errorMessage = typeof result.error === 'object' ? JSON.stringify(result.error) : result.error;
-                throw new Error(`TheirStack API returned an error: ${errorMessage}`);
-            }
-
-            if (!result.data || result.data.length === 0) {
-                Logger.log(`TheirStack found no new jobs on page ${page}. Ending search.`);
-                break; // Exit the loop if no more jobs are found
-            }
-
-            // Map the response to our standard job object format
-            const jobs = result.data.map(job => {
-                const hiringManager = job.hiring_team?.[0];
-                let employmentStatus = 'N/A';
-                if (job.employment_statuses && job.employment_statuses.length > 0) {
-                    employmentStatus = job.employment_statuses.map(s => s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(', ');
-                }
-                
-                return {
-                    id: job.id,
-                    title: job.job_title,
-                    company: job.company_object?.name || "N/A",
-                    pay: job.salary_string || "Not specified",
-                    link: job.final_url || job.source_url || job.url,
-                    hiringManagerName: hiringManager?.full_name || null,
-                    hiringManagerLink: hiringManager?.linkedin_url || null,
-                    employment_status: employmentStatus,
-                    industry: job.company_object?.industry || 'N/A',
-                    date_posted: job.date_posted ? new Date(job.date_posted).toLocaleDateString() : 'N/A'
-                };
-            });
-
-            allJobs = allJobs.concat(jobs);
-
-            if (jobs.length < limit) {
-                break; // Last page reached
-            }
-
-            page++; // Go to the next page
-
-        } catch (e) {
-            Logger.log(`Error with TheirStack API on page ${page}: ${e.toString()}`);
-            throw new Error("Failed to get jobs from TheirStack. Check logs for details.");
+        if (result.error) {
+            const errorMessage = typeof result.error === 'object' ? JSON.stringify(result.error) : result.error;
+            throw new Error(`TheirStack API returned an error: ${errorMessage}`);
         }
+        
+        if (!result.data || result.data.length === 0) {
+            Logger.log('TheirStack found no new jobs.');
+            return [];
+        }
+
+        // Map the response to our standard job object format
+        const jobs = result.data.map(job => {
+            const hiringManager = job.hiring_team?.[0];
+            return {
+                id: job.id,
+                title: job.job_title,
+                company: job.company_object?.name || "N/A",
+                pay: job.salary_string || "Not specified",
+                link: job.final_url || job.source_url || job.url,
+                hiringManagerName: hiringManager?.full_name || null,
+                hiringManagerLink: hiringManager?.linkedin_url || null,
+                employment_status: job.employment_statuses?.[0] || 'N/A',
+                industry: job.company_object?.industry || 'N/A',
+                date_posted: job.date_posted ? new Date(job.date_posted).toLocaleDateString() : 'N/A'
+            };
+        });
+
+        return jobs.filter(job => job.link); // Basic filter to ensure jobs have a link
+
+    } catch (e) {
+        Logger.log(`Error with TheirStack API: ${e.toString()}`);
+        throw new Error("Failed to get jobs from TheirStack. Check logs for details.");
     }
-    
-    return allJobs.filter(job => job.link); // Basic filter to ensure jobs have a link
 }
 
 /**
@@ -520,7 +499,6 @@ function parsePay(payString) {
  * Sorts the 'Jobs' sheet based on status and pay.
  */
 function sortJobsSheet() {
-  SPREADSHEET.toast('Sorting jobs...');
   const sheet = SPREADSHEET.getSheetByName(JOBS_SHEET_NAME);
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return;

@@ -78,13 +78,26 @@ function onOpen() {
 }
 
 /**
+ * Checks if the script is running in a context where it can access the user interface.
+ * @returns {boolean} True if the UI is available, false otherwise.
+ */
+function isUiAvailable() {
+  try {
+    SpreadsheetApp.getUi();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * A wrapper function to create and format the necessary sheets, set up conditional formatting, and hide helper columns.
  * This is called from the custom menu and is the first step for a new user.
  */
 function runInitialSetup() {
   const properties = PropertiesService.getScriptProperties();
   if (properties.getProperty('SETUP_COMPLETE') === 'true') {
-    Logger.log('Initial setup has already been run. Use "Debug > Reset Setup Lock" to run again if needed.');
+    SpreadsheetApp.getUi().alert('Setup Already Complete', 'The initial setup has already been run. To prevent accidental data loss, this action is locked. If you need to re-run the setup, please use the "Debug > Reset Setup Lock" menu item.', SpreadsheetApp.getUi().ButtonSet.OK);
     return;
   }
 
@@ -188,7 +201,7 @@ function runInitialSetup() {
 
 
   // --- 7. Final Alert ---
-  Logger.log('Setup Complete! Your "Jobs" and "Settings" sheets have been created and formatted. Please populate your details in the "Settings" tab to continue.');
+  SpreadsheetApp.getUi().alert('Setup Complete!', 'Your "Jobs" and "Settings" sheets have been created and formatted. Please populate your details in the "Settings" tab to continue.', SpreadsheetApp.getUi().ButtonSet.OK);
 
   ss.setActiveSheet(jobsSheet);
 }
@@ -364,6 +377,7 @@ function getWritingSamplesText(urlString) {
  * Main function to find and process new jobs.
  */
 function findAndProcessNewJobs() {
+  const uiAvailable = isUiAvailable();
   try {
     const settings = getSettings();
     if (!settings.apiKey || !settings.keywords) throw new Error("A Gemini API Key and Search Keywords are required.");
@@ -371,21 +385,28 @@ function findAndProcessNewJobs() {
       throw new Error("You must provide an API key for TheirStack in the Settings sheet.");
     }
     
+    if (uiAvailable) SPREADSHEET.toast('Searching for jobs with TheirStack...');
     const allJobs = findJobsWithTheirStack(settings);
 
-    // De-duplicate the combined list of jobs based on the link
     const uniqueJobs = Array.from(new Map(allJobs.map(job => [job.link, job])).values());
 
     if (uniqueJobs.length > 0) {
       processJobs(uniqueJobs);
       sortJobsSheet();
       sendNotificationEmail(uniqueJobs.length, settings.notificationEmail);
-      Logger.log(`Success! ${uniqueJobs.length} new jobs added.`);
+      const successMessage = `Success! ${uniqueJobs.length} new jobs added.`;
+      if (uiAvailable) SPREADSHEET.toast(successMessage);
+      Logger.log(successMessage);
     } else {
-       Logger.log('No new jobs were found that match your criteria.');
+       const noJobsMessage = 'No new jobs were found that match your criteria.';
+       if (uiAvailable) SPREADSHEET.toast(noJobsMessage);
+       Logger.log(noJobsMessage);
     }
   } catch (e) {
-    Logger.log(e);
+    Logger.log(`Error in findAndProcessNewJobs: ${e.message}`);
+    if (uiAvailable) {
+        SpreadsheetApp.getUi().alert('Error', e.message, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
     // Re-throw the error so the execution is marked as 'Failed'
     throw e;
   }
@@ -744,8 +765,9 @@ ${writingSamples}
 function resetSetupLock() {
   try {
     PropertiesService.getScriptProperties().deleteProperty('SETUP_COMPLETE');
-    Logger.log('The setup lock has been reset. You can now run the initial setup again.');
+    SpreadsheetApp.getUi().alert('Success', 'The setup lock has been reset. You can now run the initial setup again. Warning: This will delete your existing data.', SpreadsheetApp.getUi().ButtonSet.OK);
   } catch (e) {
     Logger.log(`Error resetting setup lock: ${e.message}`);
+    SpreadsheetApp.getUi().alert('Error', `Could not reset the setup lock. Error: ${e.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
   }
 }

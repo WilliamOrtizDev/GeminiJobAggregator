@@ -72,7 +72,8 @@ function onOpen() {
     .addItem('3. Generate Next Cover Letter', 'generateSingleCoverLetter')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('Debug')
-        .addItem('Reset Setup Lock', 'resetSetupLock'))
+        .addItem('Reset Setup Lock', 'resetSetupLock')
+        .addItem('Force Sort Sheet', 'sortJobsSheet'))
     .addToUi();
 }
 
@@ -83,7 +84,7 @@ function onOpen() {
 function runInitialSetup() {
   const properties = PropertiesService.getScriptProperties();
   if (properties.getProperty('SETUP_COMPLETE') === 'true') {
-    SpreadsheetApp.getUi().alert('Setup Already Complete', 'The initial setup has already been run. To prevent accidental data loss, this action is locked. If you need to re-run the setup, please use the "Debug > Reset Setup Lock" menu item.', SpreadsheetApp.getUi().ButtonSet.OK);
+    Logger.log('Initial setup has already been run. Use "Debug > Reset Setup Lock" to run again if needed.');
     return;
   }
 
@@ -187,7 +188,7 @@ function runInitialSetup() {
 
 
   // --- 7. Final Alert ---
-  SpreadsheetApp.getUi().alert('Setup Complete!', 'Your "Jobs" and "Settings" sheets have been created and formatted. Please populate your details in the "Settings" tab to continue.', SpreadsheetApp.getUi().ButtonSet.OK);
+  Logger.log('Setup Complete! Your "Jobs" and "Settings" sheets have been created and formatted. Please populate your details in the "Settings" tab to continue.');
 
   ss.setActiveSheet(jobsSheet);
 }
@@ -370,95 +371,118 @@ function findAndProcessNewJobs() {
       throw new Error("You must provide an API key for TheirStack in the Settings sheet.");
     }
     
-    SPREADSHEET.toast('Searching for jobs with TheirStack...');
-    const newJobs = findJobsWithTheirStack(settings);
+    const allJobs = findJobsWithTheirStack(settings);
 
-    if (newJobs.length > 0) {
-      processJobs(newJobs);
+    // De-duplicate the combined list of jobs based on the link
+    const uniqueJobs = Array.from(new Map(allJobs.map(job => [job.link, job])).values());
+
+    if (uniqueJobs.length > 0) {
+      processJobs(uniqueJobs);
       sortJobsSheet();
-      sendNotificationEmail(newJobs.length, settings.notificationEmail);
-      SPREADSHEET.toast(`Success! ${newJobs.length} new jobs were added.`);
+      sendNotificationEmail(uniqueJobs.length, settings.notificationEmail);
+      Logger.log(`Success! ${uniqueJobs.length} new jobs added.`);
     } else {
-       Logger.log('No new jobs found during this run.');
-       SPREADSHEET.toast('No new jobs were found that match your criteria.');
+       Logger.log('No new jobs were found that match your criteria.');
     }
   } catch (e) {
-    Logger.log(`Error in findAndProcessNewJobs: ${e.message}`);
-    SPREADSHEET.toast(`An error occurred: ${e.message}`);
+    Logger.log(e);
+    // Re-throw the error so the execution is marked as 'Failed'
+    throw e;
   }
 }
 
 /**
- * Finds jobs using the TheirStack service.
+ * Finds jobs using the TheirStack service, paginating to get all results.
  * @param {object} settings The script settings.
  * @returns {Array<object>} An array of job objects.
  */
 function findJobsWithTheirStack(settings) {
     const url = `https://api.theirstack.com/v1/jobs/search`;
     const existingJobIds = getExistingJobIds();
+    let allJobs = [];
+    let page = 0;
+    const limit = 100; // TheirStack's max limit per page
 
-    const payload = {
-        include_total_results: false,
-        posted_at_max_age_days: 30,
-        job_country_code_or: ["US"],
-        job_title_or: [settings.keywords],
-        company_country_code_or: ["US"],
-        min_salary_usd: 1,
-        remote: true,
-        page: 0,
-        limit: 50,
-        blur_company_data: false,
-        job_id_not: existingJobIds
-    };
+    while (true) {
+        const payload = {
+            limit: limit,
+            order_by: [{
+                desc: true,
+                field: "date_posted"
+            }],
+            blur_company_data: false,
+            job_title_or: [settings.keywords],
+            job_country_code_or: ["US"],
+            posted_at_max_age_days: 30,
+            company_country_code_or: ["US"],
+            remote: true,
+            page: page,
+            include_total_results: false,
+            job_id_not: existingJobIds
+        };
 
-    const options = {
-        method: 'post',
-        contentType: 'application/json',
-        headers: {
-            'Authorization': 'Bearer ' + settings.theirStackApiKey
-        },
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-    };
+        const options = {
+            method: 'post',
+            contentType: 'application/json',
+            headers: {
+                'Authorization': 'Bearer ' + settings.theirStackApiKey
+            },
+            payload: JSON.stringify(payload),
+            muteHttpExceptions: true
+        };
 
-    try {
-        const response = UrlFetchApp.fetch(url, options);
-        const responseText = response.getContentText();
-        const result = JSON.parse(responseText);
+        try {
+            const response = UrlFetchApp.fetch(url, options);
+            const responseText = response.getContentText();
+            const result = JSON.parse(responseText);
 
-        if (result.error) {
-            const errorMessage = typeof result.error === 'object' ? JSON.stringify(result.error) : result.error;
-            throw new Error(`TheirStack API returned an error: ${errorMessage}`);
+            if (result.error) {
+                const errorMessage = typeof result.error === 'object' ? JSON.stringify(result.error) : result.error;
+                throw new Error(`TheirStack API returned an error: ${errorMessage}`);
+            }
+
+            if (!result.data || result.data.length === 0) {
+                Logger.log(`TheirStack found no new jobs on page ${page}. Ending search.`);
+                break; // Exit the loop if no more jobs are found
+            }
+
+            // Map the response to our standard job object format
+            const jobs = result.data.map(job => {
+                const hiringManager = job.hiring_team?.[0];
+                let employmentStatus = 'N/A';
+                if (job.employment_statuses && job.employment_statuses.length > 0) {
+                    employmentStatus = job.employment_statuses.map(s => s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())).join(', ');
+                }
+                
+                return {
+                    id: job.id,
+                    title: job.job_title,
+                    company: job.company_object?.name || "N/A",
+                    pay: job.salary_string || "Not specified",
+                    link: job.final_url || job.source_url || job.url,
+                    hiringManagerName: hiringManager?.full_name || null,
+                    hiringManagerLink: hiringManager?.linkedin_url || null,
+                    employment_status: employmentStatus,
+                    industry: job.company_object?.industry || 'N/A',
+                    date_posted: job.date_posted ? new Date(job.date_posted).toLocaleDateString() : 'N/A'
+                };
+            });
+
+            allJobs = allJobs.concat(jobs);
+
+            if (jobs.length < limit) {
+                break; // Last page reached
+            }
+
+            page++; // Go to the next page
+
+        } catch (e) {
+            Logger.log(`Error with TheirStack API on page ${page}: ${e.toString()}`);
+            throw new Error("Failed to get jobs from TheirStack. Check logs for details.");
         }
-        
-        if (!result.data || result.data.length === 0) {
-            Logger.log('TheirStack found no new jobs.');
-            return [];
-        }
-
-        // Map the response to our standard job object format
-        const jobs = result.data.map(job => {
-            const hiringManager = job.hiring_team?.[0];
-            return {
-                id: job.id,
-                title: job.job_title,
-                company: job.company_object?.name || "N/A",
-                pay: job.salary_string || "Not specified",
-                link: job.final_url || job.source_url || job.url,
-                hiringManagerName: hiringManager?.full_name || null,
-                hiringManagerLink: hiringManager?.linkedin_url || null,
-                employment_status: job.employment_statuses?.[0] || 'N/A',
-                industry: job.company_object?.industry || 'N/A',
-                date_posted: job.date_posted ? new Date(job.date_posted).toLocaleDateString() : 'N/A'
-            };
-        });
-
-        return jobs.filter(job => job.link); // Basic filter to ensure jobs have a link
-
-    } catch (e) {
-        Logger.log(`Error with TheirStack API: ${e.toString()}`);
-        throw new Error("Failed to get jobs from TheirStack. Check logs for details.");
     }
+    
+    return allJobs.filter(job => job.link); // Basic filter to ensure jobs have a link
 }
 
 /**
@@ -720,9 +744,8 @@ ${writingSamples}
 function resetSetupLock() {
   try {
     PropertiesService.getScriptProperties().deleteProperty('SETUP_COMPLETE');
-    SpreadsheetApp.getUi().alert('Success', 'The setup lock has been reset. You can now run the initial setup again. Warning: This will delete your existing data.', SpreadsheetApp.getUi().ButtonSet.OK);
+    Logger.log('The setup lock has been reset. You can now run the initial setup again.');
   } catch (e) {
     Logger.log(`Error resetting setup lock: ${e.message}`);
-    SpreadsheetApp.getUi().alert('Error', `Could not reset the setup lock. Error: ${e.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
   }
 }
